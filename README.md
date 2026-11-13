@@ -1,0 +1,111 @@
+# VTech RM5766HD Camera Unit RTSP & Safety Toggle Mod
+
+Prebuilt and source-backed `LD_PRELOAD` RTSP server (`librtsp_cam.so`) plus physical PAIR-button toggle daemon (`telnet_btn`) for the **VTech RM5766HD** Camera Unit.
+
+No recompilation is required to restore or deploy — prebuilt MIPS binaries are checked into [`bin/`](bin/).
+
+---
+
+## Hardware & Firmware Overview
+
+- **Target Device:** VTech RM5766HD Baby Monitor (Camera Unit)
+- **SoC / Architecture:** Ingenic `T31` (MIPS32EL, uClibc)
+- **Serial Console:** `ttyS1` (`115200 8N1`), stock `/etc/inittab` has serial `getty` commented out
+- **Flash Layout (`/proc/mtd`):**
+  - `mtd0`: `uboot`
+  - `mtd1`: `kernel`
+  - `mtd2`: `rootfs` (`ubi0:rootfs`, UBIFS rw)
+  - `mtd3`: `Vtech_data1` (`/data1`, UBIFS rw)
+  - `mtd4`: `Vtech_data2` (`/data2`, UBIFS rw — logs, events DB, user settings)
+- **Stock Application:** `/factory/mount_app_image.sh` mounts the SquashFS image read-only at `/home/root` (contains `boot_script`, `run_application.sh`, and `vt_cam`).
+
+---
+
+## What Was Changed
+
+Only **4 files** were added or modified on `ubi0:rootfs` (`mtd2`). `/home/root`, `/data1`, and `/data2` are untouched, and `/etc/init.d/rcS.stock` is preserved on flash.
+
+### 1. Prebuilt Shared Library: `/usr/lib/librtsp_cam.so` ([`src/librtsp_cam.c`](src/librtsp_cam.c))
+- Preloaded into `/home/root/vt_cam` (`LD_PRELOAD=/usr/lib/librtsp_cam.so`).
+- Exposes `rtsp://<camera-ip>:554/live` (RTSP-over-TCP, H.264 video + G.711 PCMA audio) using virtual ThroughTek stream `VIRTUAL_SID=7` (`avIndex=107`).
+- **Low-idle on-demand streaming:** Boots in `IDLE` state with zero extra encoding load, starts video when an RTSP client connects, and stops after `3000ms` of no active RTSP clients (`AUDIOSTOP(769)`, `STOP(767)`, `STOP_STREAM(1898)` with `set_stop_stream_noreboot()`).
+- **Mobile app resolution-switch fix:** Calls `sync_open_channel_mode()` and `IOCTRL_VTECH_STOP_STREAM (1898)` cleanly so `1080p` <-> `720p` switching works without a Parent Unit connected.
+
+### 2. PAIR Button Daemon: `/usr/sbin/telnet_btn` ([`src/telnet_btn.c`](src/telnet_btn.c))
+Polls `/sys/class/gpio/gpio9/value` (PAIR button, active-low) every `40ms`:
+- **3 short taps** (`< 800ms` hold each, `< 1000ms` apart, then pause `> 1000ms`): toggles BusyBox `/usr/sbin/telnetd -l /bin/sh` ON/OFF (`telnetd` defaults to OFF on boot).
+- **5 short taps** (`< 800ms` hold each, `< 1000ms` apart): renames `/usr/lib/librtsp_cam.so` <-> `/usr/lib/librtsp_cam.so.off`, runs `sync`, and reboots — non-destructively toggling between RTSP mode and 100% stock `vt_cam` without wiping pairing or settings.
+
+### 3. Startup Hooks: `/etc/init.d/rcS` ([`scripts/patch_rcS.sh`](scripts/patch_rcS.sh)) & [`rootfs/etc/init.d/app_launch.sh`](rootfs/etc/init.d/app_launch.sh)
+- `/etc/init.d/rcS` (patched by `scripts/patch_rcS.sh`): Mounts `devpts`, starts `/usr/sbin/telnet_btn`, and wraps `boot_script` via `/tmp/boot_wrap.sh` -> `/etc/init.d/app_launch.sh` only when `/etc/test_preload.so` or `/usr/lib/librtsp_cam.so` exists; otherwise runs stock `/home/root/boot_script NODEBUG` directly.
+- [`rootfs/etc/init.d/app_launch.sh`](rootfs/etc/init.d/app_launch.sh): Runs `/home/root/vt_cam` with `LD_PRELOAD=/usr/lib/librtsp_cam.so` (reboots if `vt_cam` exits).
+
+---
+
+## Prebuilt Binaries Included
+
+| Artifact | Purpose | Target Path | MD5 (`bin/`) |
+|---|---|---|---|
+| [`bin/librtsp_cam.so`](bin/librtsp_cam.so) | RTSP server + app sync `LD_PRELOAD` | `/usr/lib/librtsp_cam.so` | `30c61b8baabfc18c3e32f6671560628b` |
+| [`bin/telnet_btn`](bin/telnet_btn) | PAIR button 3x/5x daemon | `/usr/sbin/telnet_btn` | `725dab0f2917094a7c2fdeb27d5530fe` |
+
+---
+
+## How to Restore the Camera to a Complete Stock State
+
+- **Temporary / reversible stock mode:** Tap PAIR **5 times** to move `/usr/lib/librtsp_cam.so` -> `/usr/lib/librtsp_cam.so.off` and boot stock `vt_cam`. Another 5 taps restores RTSP mode.
+- **Complete removal of all rootfs modifications:**
+  1. Enable telnet via **3x PAIR** and log in as `root` (no password).
+  2. Remove the added files and restore `/etc/init.d/rcS.stock`:
+     ```sh
+     rm -f /usr/lib/librtsp_cam.so /usr/lib/librtsp_cam.so.off /usr/sbin/telnet_btn /etc/init.d/app_launch.sh /etc/test_preload.so
+     mv /etc/init.d/rcS.stock /etc/init.d/rcS
+     chmod 755 /etc/init.d/rcS
+     sync
+     reboot
+     ```
+
+---
+
+## How to Restore the Mods If the Camera Is Ever Wiped
+
+- **Case A — App / Pairing / User Settings reset (`/data1`, `/data2`):**
+  Rootfs (`mtd2`) mods remain intact. Just re-pair the camera in VTech setup; 3x/5x PAIR and RTSP continue working.
+- **Case B — Full `mtd2` (`ubi0:rootfs`) wipe / stock firmware restore (no recompiling needed):**
+  1. **Regain shell via 3.3V UART (`ttyS1`, `115200 8N1`):**
+     Interrupt **U-Boot** and boot once with `init=/bin/sh` appended to stock `bootargs`:
+     ```text
+     console=ttyS1,115200n8 mem=37M@0x0 rmem=27M@0x2500000 ip=off init=/bin/sh ubi.mtd=2 ubi.mtd=3 ubi.mtd=4 root=ubi0:rootfs rootfstype=ubifs rw
+     ```
+     Temporarily uncomment `##telnetd &` in `/etc/init.d/rcS` (with `mkdir -p /dev/pts && mount -t devpts devpts /dev/pts`), `sync`, and reboot normally so Wi-Fi and telnet come up.
+  2. **Deploy prebuilt binaries and helper scripts over telnet** (set `CAM_HOST=<ip>` if not `192.168.1.243`):
+     ```sh
+     cd scripts
+     python3 upload.py ../bin/librtsp_cam.so /usr/lib/librtsp_cam.so 755
+     python3 upload.py ../bin/telnet_btn /usr/sbin/telnet_btn 755
+     python3 upload.py ../rootfs/etc/init.d/app_launch.sh /etc/init.d/app_launch.sh 755
+     python3 upload.py patch_rcS.sh /tmp/patch_rcS.sh 755
+     ```
+  3. **Patch `/etc/init.d/rcS` on the camera** (backs up clean `/etc/init.d/rcS.stock`, or restore your clean stock backup first if you edited `rcS` in step 1):
+     ```sh
+     python3 tel.py "/tmp/patch_rcS.sh"
+     ```
+  4. **Reboot & verify:**
+     ```sh
+     sync && reboot
+     ```
+     Confirm telnet port `23` is closed by default after boot, then verify cold RTSP start and idle auto-stop wake:
+     ```sh
+     python3 scripts/check_rtsp.py --cycle
+     ```
+
+---
+
+## Rebuilding from Source (Optional)
+
+Uses `../vtech/toolchain/mips32el--uclibc--stable-2020.08-1` (or override `TOOLCHAIN_BIN` / `CROSS_COMPILE`):
+
+```sh
+make        # Rebuilds bin/librtsp_cam.so and bin/telnet_btn
+make test   # Runs host unit tests for telnet_btn tap timing state machine
+```
